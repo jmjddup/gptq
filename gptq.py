@@ -55,7 +55,7 @@ class GPTQ:
         # inp = inp.float()
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         # self.H += 2 / self.nsamples * inp.matmul(inp.t())
-        self.H += inp.matmul(inp.t())
+        self.H += inp.matmul(inp.t())    # shape: [k, k]
 
     def fasterquant(
         self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False
@@ -69,15 +69,18 @@ class GPTQ:
 
         tick = time.time()
 
+        # 初始化量化器：计算权重的scale/zero/maxq
         if not self.quantizer.ready():
             self.quantizer.find_params(W, weight=True)
 
+        # 预处理海森矩阵H
         H = self.H
         del self.H
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
 
+        # 静态分组量化：每组权重单独计算scale/zero，提升低比特量化精度
         if static_groups:
             import copy
             groups = []
@@ -86,15 +89,17 @@ class GPTQ:
                 quantizer.find_params(W[:, i:(i + groupsize)], weight=True)
                 groups.append(quantizer)
 
+        # 激活顺序优化：按H对角线值降序排序（优先量化贡献大的权重）
         if actorder:
             perm = torch.argsort(torch.diag(H), descending=True)
             W = W[:, perm]
             H = H[perm][:, perm]
-            invperm = torch.argsort(perm)
+            invperm = torch.argsort(perm) # 逆序索引——用于恢复顺序
 
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
 
+        # 求解H逆矩阵
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
@@ -103,20 +108,25 @@ class GPTQ:
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
 
+        # 分块逐列量化
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
 
+            # 提取当前块的权重W和Hinv子矩阵
             W1 = W[:, i1:i2].clone()
             Q1 = torch.zeros_like(W1)
             Err1 = torch.zeros_like(W1)
             Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
 
+            # 逐列量化当前块
             for i in range(count):
+                # 提取第i列权重W和Hinv对角线值
                 w = W1[:, i]
                 d = Hinv1[i, i]
 
+                # 动态分组量化：每groupsize列重新计算量化参数
                 if groupsize != -1:
                     if not static_groups:
                         if (i1 + i) % groupsize == 0:
@@ -126,20 +136,22 @@ class GPTQ:
                         if actorder:
                             idx = perm[idx]
                         self.quantizer = groups[idx // groupsize]
-
+                # 执行量化
                 q = quantize(
                     w.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
                 ).flatten()
-                Q1[:, i] = q
-                Losses1[:, i] = (w - q) ** 2 / d ** 2
+                Q1[:, i] = q # 保存量化结果
+                Losses1[:, i] = (w - q) ** 2 / d ** 2 # 计算损失
 
-                err1 = (w - q) / d
+                err1 = (w - q) / d # 误差传播
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
 
+            # 保存当前块的量化结果与损失
             Q[:, i1:i2] = Q1
             Losses[:, i1:i2] = Losses1 / 2
 
+            # 将当前块的误差传播到后续块
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
             if DEBUG:
@@ -152,11 +164,13 @@ class GPTQ:
         print('time %.2f' % (time.time() - tick))
         print('error', torch.sum(Losses).item())
 
+        # 恢复激活顺序的权重
         if actorder:
             Q = Q[:, invperm]
 
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
+        # 将量化后的权重赋值给模型
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         if DEBUG:
             print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
