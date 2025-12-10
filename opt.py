@@ -478,7 +478,7 @@ if __name__ == '__main__':
         model = load_quant3(args.model, args.load)
     else:
         model = get_opt(args.model)
-        model.eval()
+        model.eval() # 切换到评估模式
 
     dataloader, testloader = get_loaders(
         args.dataset,
